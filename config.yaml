@@ -1,0 +1,90 @@
+# =============================================================================
+# EigenPSF-DPS: Non-blind Spatially Varying Deconvolution Configuration
+# =============================================================================
+# This configuration file defines all hyperparameters for the EigenPSF-DPS
+# algorithm, which uses diffusion posterior sampling with PCA-decomposed
+# spatially varying blur operators.
+
+# -----------------------------------------------------------------------------
+# Data Configuration
+# -----------------------------------------------------------------------------
+data:
+  img_size: 256                    # Image resolution (H x W)
+  subset_size: 1                   # Number of images to process (demo mode)
+  channels: 3                      # Number of image channels (RGB)
+  image_source: "sample"           # "sample" (built-in), "url", or path to image
+
+# -----------------------------------------------------------------------------
+# Diffusion Model Configuration
+# -----------------------------------------------------------------------------
+model:
+  model_id: "google/ddpm-celebahq-256"  # HuggingFace model identifier
+  device: "cuda"                         # Device: "cuda" or "cpu"
+  dtype: "float32"                       # Precision: "float32" or "float16"
+
+# -----------------------------------------------------------------------------
+# Physics / Blur Simulation Configuration
+# -----------------------------------------------------------------------------
+physics:
+  # Blur mode: "motion" (directional), "defocus" (circular), or "mixed"
+  blur_mode: "motion"
+
+  # Spatially varying blur parameters
+  kernel_size: 21                  # Size of each local PSF kernel
+  grid_size: 8                     # Number of PSF samples along each axis (8x8 grid)
+
+  # Motion blur specific parameters
+  motion:
+    min_length: 5                  # Minimum motion blur length (pixels)
+    max_length: 25                 # Maximum motion blur length (pixels)
+    angle_variation: 180           # Angle variation range (degrees)
+
+  # Defocus blur specific parameters
+  defocus:
+    min_radius: 2                  # Minimum defocus radius (pixels)
+    max_radius: 12                 # Maximum defocus radius (pixels)
+
+  # EigenPSF decomposition parameters
+  n_eigen_psfs: 5                  # Number of PCA components (K)
+
+  # Measurement noise
+  sigma_noise: 0.01                # Gaussian noise standard deviation
+
+# -----------------------------------------------------------------------------
+# DPS (Diffusion Posterior Sampling) Configuration
+# -----------------------------------------------------------------------------
+dps:
+  # Guidance parameters
+  step_size: 100.0                 # Gradient scale (zeta) for likelihood guidance
+  step_size_schedule: "constant"   # "constant", "linear_decay", or "sqrt_decay"
+
+  # Sampling parameters
+  num_inference_steps: 1000        # Total diffusion steps
+  skip_steps: 0                    # Steps to skip (0 = use all steps)
+
+  # Gradient clipping for stability
+  gradient_clip: 1.0               # Max gradient norm (0 = no clipping)
+
+  # Whether to use gradient checkpointing (saves memory)
+  gradient_checkpointing: false
+
+# -----------------------------------------------------------------------------
+# Output Configuration
+# -----------------------------------------------------------------------------
+output:
+  save_dir: "./results"            # Output directory
+  save_intermediate: true          # Save intermediate reconstructions
+  intermediate_freq: 100           # Save every N steps
+  save_format: "png"               # Image format: "png" or "jpg"
+
+# -----------------------------------------------------------------------------
+# Logging Configuration
+# -----------------------------------------------------------------------------
+logging:
+  level: "INFO"                    # Logging level
+  progress_bar: true               # Show tqdm progress bar
+
+# -----------------------------------------------------------------------------
+# Reproducibility
+# -----------------------------------------------------------------------------
+seed: 42                           # Random seed for reproducibility
