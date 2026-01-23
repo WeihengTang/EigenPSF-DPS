@@ -37,7 +37,7 @@ import matplotlib.pyplot as plt
 
 # Local imports
 from physics import create_sv_blur_system, EigenPSFDecomposition, SVBlurOperator, TrueSVBlurOperator
-from dps import create_dps_pipeline, EigenPSFDPSPipeline
+from dps import create_dps_pipeline, download_model, EigenPSFDPSPipeline
 from utils import (
     load_config,
     save_config,
@@ -139,6 +139,24 @@ def parse_args() -> argparse.Namespace:
         "--image",
         type=str,
         help="Path to input image (or 'sample' for synthetic)",
+    )
+
+    # Model download options
+    parser.add_argument(
+        "--download_only",
+        action="store_true",
+        help="Only download and cache the model, then exit (useful on clusters)",
+    )
+    parser.add_argument(
+        "--model_cache",
+        type=str,
+        help="Directory for caching downloaded model weights",
+    )
+    parser.add_argument(
+        "--max_retries",
+        type=int,
+        default=5,
+        help="Maximum number of download retry attempts",
     )
 
     return parser.parse_args()
@@ -324,6 +342,22 @@ def main() -> int:
     logger.info("EigenPSF-DPS: Non-blind Spatially Varying Deconvolution")
     logger.info("=" * 60)
 
+    # Handle download-only mode
+    if args.download_only:
+        model_id = config["model"].get("model_id", "google/ddpm-celebahq-256")
+        logger.info("Download-only mode: pre-downloading model weights...")
+        try:
+            download_model(
+                model_id=model_id,
+                cache_dir=args.model_cache,
+                max_retries=args.max_retries,
+            )
+            logger.info("Model downloaded successfully. You can now run without --download_only.")
+            return 0
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+            return 1
+
     # Setup reproducibility
     seed = config.get("seed", 42)
     set_seed(seed)
@@ -415,11 +449,13 @@ def main() -> int:
             device=device,
             dtype=dtype,
             use_v2=False,
+            cache_dir=args.model_cache,
+            max_retries=args.max_retries,
         )
     except Exception as e:
         logger.error(f"Failed to load diffusion model: {e}")
-        logger.error("Please ensure you have internet access and the model is available.")
-        logger.error("You can also try a different model with --model_id")
+        logger.error("Try pre-downloading the model with: python main.py --download_only")
+        logger.error("Or specify a cache directory: python main.py --model_cache ./model_cache")
         return 1
 
     # =========================================================================

@@ -421,30 +421,117 @@ def load_pretrained_diffusion_model(
     model_id: str = "google/ddpm-celebahq-256",
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float32,
+    cache_dir: Optional[str] = None,
+    max_retries: int = 5,
 ) -> Tuple[UNet2DModel, DDPMScheduler]:
-    """Load a pre-trained diffusion model from HuggingFace.
+    """Load a pre-trained diffusion model from HuggingFace with retry logic.
 
     Args:
-        model_id: HuggingFace model identifier
+        model_id: HuggingFace model identifier or local path
         device: Torch device
         dtype: Torch dtype
+        cache_dir: Optional directory for caching downloaded models
+        max_retries: Maximum number of download retry attempts
 
     Returns:
         Tuple of (UNet2DModel, DDPMScheduler)
     """
+    import time
+    from pathlib import Path
+
     logger.info(f"Loading pre-trained model: {model_id}")
 
-    # Load UNet
-    unet = UNet2DModel.from_pretrained(model_id)
+    # Check if model_id is a local path
+    local_path = Path(model_id)
+    is_local = local_path.exists() and local_path.is_dir()
+
+    if is_local:
+        logger.info(f"Loading model from local path: {model_id}")
+
+    # Load UNet with retry logic
+    unet = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            unet = UNet2DModel.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                resume_download=True,
+                local_files_only=is_local,
+            )
+            break
+        except Exception as e:
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"Failed to load UNet after {max_retries} attempts. "
+                    f"Last error: {e}\n"
+                    f"Try pre-downloading with: python main.py --download_only"
+                ) from e
+            wait_time = min(2 ** attempt, 60)
+            logger.warning(
+                f"Download attempt {attempt}/{max_retries} failed: {e}. "
+                f"Retrying in {wait_time}s..."
+            )
+            time.sleep(wait_time)
+
     unet = unet.to(device=device, dtype=dtype)
     unet.eval()
 
-    # Load scheduler
-    scheduler = DDPMScheduler.from_pretrained(model_id)
+    # Load scheduler (lightweight, no retry needed)
+    scheduler = DDPMScheduler.from_pretrained(
+        model_id,
+        cache_dir=cache_dir,
+        local_files_only=is_local,
+    )
 
     logger.info(f"Model loaded successfully. UNet params: {sum(p.numel() for p in unet.parameters()):,}")
 
     return unet, scheduler
+
+
+def download_model(
+    model_id: str = "google/ddpm-celebahq-256",
+    cache_dir: Optional[str] = None,
+    max_retries: int = 5,
+) -> None:
+    """Pre-download model weights to local cache.
+
+    Useful on clusters with unreliable network connections.
+
+    Args:
+        model_id: HuggingFace model identifier
+        cache_dir: Optional directory for caching
+        max_retries: Maximum number of retry attempts
+    """
+    import time
+
+    logger.info(f"Pre-downloading model: {model_id}")
+    if cache_dir:
+        logger.info(f"Cache directory: {cache_dir}")
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            _ = UNet2DModel.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+                resume_download=True,
+            )
+            _ = DDPMScheduler.from_pretrained(
+                model_id,
+                cache_dir=cache_dir,
+            )
+            logger.info("Model downloaded and cached successfully.")
+            return
+        except Exception as e:
+            if attempt == max_retries:
+                raise RuntimeError(
+                    f"Failed to download model after {max_retries} attempts: {e}"
+                ) from e
+            wait_time = min(2 ** attempt, 60)
+            logger.warning(
+                f"Download attempt {attempt}/{max_retries} failed: {e}. "
+                f"Retrying in {wait_time}s..."
+            )
+            time.sleep(wait_time)
 
 
 def create_dps_pipeline(
@@ -453,6 +540,8 @@ def create_dps_pipeline(
     device: torch.device = torch.device("cpu"),
     dtype: torch.dtype = torch.float32,
     use_v2: bool = False,
+    cache_dir: Optional[str] = None,
+    max_retries: int = 5,
 ) -> EigenPSFDPSPipeline:
     """Create a complete DPS pipeline.
 
@@ -462,11 +551,15 @@ def create_dps_pipeline(
         device: Torch device
         dtype: Torch dtype
         use_v2: Whether to use enhanced V2 pipeline
+        cache_dir: Optional directory for caching downloaded models
+        max_retries: Maximum number of download retry attempts
 
     Returns:
         Configured DPS pipeline
     """
-    unet, scheduler = load_pretrained_diffusion_model(model_id, device, dtype)
+    unet, scheduler = load_pretrained_diffusion_model(
+        model_id, device, dtype, cache_dir=cache_dir, max_retries=max_retries
+    )
 
     if use_v2:
         pipeline = EigenPSFDPSPipelineV2(

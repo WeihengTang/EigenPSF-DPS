@@ -95,7 +95,12 @@ python -c "import diffusers; print(f'Diffusers: {diffusers.__version__}')"
 
 ### Basic Usage
 
-Run with default settings (synthetic face image, motion blur):
+First, pre-download the model weights (recommended on HPC clusters):
+```bash
+python main.py --download_only
+```
+
+Then run with default settings (synthetic face image, motion blur):
 ```bash
 python main.py
 ```
@@ -290,8 +295,28 @@ restored, intermediates = pipeline(
 - Enable gradient checkpointing: `dps.gradient_checkpointing: true`
 
 ### Model Download Issues
-- Ensure internet connectivity
-- Set HuggingFace cache: `export HF_HOME=/path/to/cache`
+The model download (~455 MB) can fail on clusters with unreliable network connections.
+The built-in retry logic (exponential backoff, resume support) handles transient failures.
+
+**Pre-download the model** (recommended on clusters):
+```bash
+# Download model with retries (no GPU needed)
+python main.py --download_only
+
+# Or specify a custom cache directory
+python main.py --download_only --model_cache ./model_cache
+
+# Increase retries for very unstable connections
+python main.py --download_only --max_retries 10
+```
+
+Once cached, subsequent runs will load from disk:
+```bash
+python main.py --model_cache ./model_cache --blur_mode defocus
+```
+
+Other options:
+- Set HuggingFace cache globally: `export HF_HOME=/path/to/cache`
 - Try alternative model: `--model_id "google/ddpm-cifar10-32"`
 
 ### Poor Reconstruction Quality
