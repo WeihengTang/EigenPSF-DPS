@@ -149,7 +149,7 @@ def load_sample_image(
     """Load or generate a sample image for testing.
 
     Args:
-        source: Image source - "sample" (generated), URL, or file path
+        source: Image source - "sample" (uses skimage), URL, or file path
         size: Target image size
         device: Torch device
         dtype: Torch dtype
@@ -158,8 +158,7 @@ def load_sample_image(
         Image tensor of shape (1, 3, H, W) normalized to [-1, 1]
     """
     if source == "sample":
-        # Generate a synthetic face-like image using smooth gradients and shapes
-        img = _generate_synthetic_face(size, device, dtype)
+        img = _load_skimage_sample(size, device, dtype)
     elif source.startswith(("http://", "https://")):
         img = _load_image_from_url(source, size, device, dtype)
     else:
@@ -168,53 +167,100 @@ def load_sample_image(
     return img
 
 
-def _generate_synthetic_face(
+def _load_skimage_sample(
     size: int,
     device: torch.device,
     dtype: torch.dtype,
 ) -> Tensor:
-    """Generate a synthetic face-like image for testing.
+    """Load a real sample image from scikit-image.
 
-    Creates a smooth, face-like pattern using geometric shapes and gradients.
+    Tries astronaut() first (512x512 RGB photo with rich high-frequency detail),
+    falls back to a detailed synthetic image if skimage is unavailable.
+    """
+    try:
+        from skimage import data
+        from PIL import Image
+
+        # astronaut() is a 512x512 real photo with texture, edges, and fine detail
+        img_np = data.astronaut().astype(np.float32) / 255.0
+
+        # Resize to target size using PIL for quality
+        img_pil = Image.fromarray((img_np * 255).astype(np.uint8))
+        img_pil = img_pil.resize((size, size), Image.Resampling.LANCZOS)
+        img_np = np.array(img_pil).astype(np.float32) / 255.0
+
+        img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)  # (3, H, W)
+        img_tensor = img_tensor * 2 - 1  # Normalize to [-1, 1]
+
+        logger.info("Loaded skimage.data.astronaut() as test image")
+        return img_tensor.unsqueeze(0).to(device=device, dtype=dtype)
+
+    except ImportError:
+        logger.warning("scikit-image not available, using synthetic test image")
+        return _generate_synthetic_image(size, device, dtype)
+
+
+def _generate_synthetic_image(
+    size: int,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> Tensor:
+    """Generate a synthetic image with rich high-frequency content.
+
+    Creates a test pattern with sharp edges, fine textures, and varying
+    spatial frequencies that blur will visibly degrade.
     """
     H, W = size, size
-    center_y, center_x = H // 2, W // 2
 
-    # Create coordinate grids
     y, x = torch.meshgrid(
         torch.linspace(-1, 1, H, device=device, dtype=dtype),
         torch.linspace(-1, 1, W, device=device, dtype=dtype),
         indexing="ij"
     )
 
-    # Background gradient (skin-like tone)
+    # Zone plate pattern (chirp) - has all spatial frequencies
     r = torch.sqrt(x**2 + y**2)
-    background = 0.8 - 0.3 * r
+    zone_plate = 0.5 * torch.cos(40.0 * r**2)
 
-    # Face oval
-    face_mask = torch.exp(-((x/0.6)**2 + (y/0.7)**2) * 3)
+    # Sharp-edged geometric shapes
+    # Checkerboard pattern (high frequency)
+    checker = torch.sign(torch.sin(16 * np.pi * x) * torch.sin(16 * np.pi * y))
 
-    # Eyes (two dark spots)
-    eye_l = torch.exp(-((x + 0.25)**2 + (y + 0.15)**2) * 50)
-    eye_r = torch.exp(-((x - 0.25)**2 + (y + 0.15)**2) * 50)
+    # Concentric sharp rings
+    rings = torch.sign(torch.sin(20 * np.pi * r))
 
-    # Nose (subtle vertical gradient)
-    nose = torch.exp(-(x**2 * 100 + (y - 0.1)**2 * 20)) * 0.3
+    # Star pattern with sharp edges
+    theta = torch.atan2(y, x)
+    star = torch.sign(torch.sin(8 * theta)) * (r < 0.7).float()
 
-    # Mouth (horizontal dark line)
-    mouth = torch.exp(-(x**2 * 30 + (y - 0.4)**2 * 200)) * 0.5
+    # Text-like fine horizontal lines
+    fine_lines = torch.sign(torch.sin(50 * np.pi * y)) * (torch.abs(x) < 0.3).float()
 
-    # Combine channels
-    red = background * face_mask - 0.3 * (eye_l + eye_r) - 0.1 * mouth + 0.1 * nose
-    green = (background - 0.1) * face_mask - 0.3 * (eye_l + eye_r) - 0.1 * mouth + 0.05 * nose
-    blue = (background - 0.2) * face_mask - 0.25 * (eye_l + eye_r) - 0.1 * mouth
+    # Compose: different patterns in different quadrants
+    # Top-left: zone plate, Top-right: checkerboard
+    # Bottom-left: star, Bottom-right: rings + lines
+    tl = (x < 0).float() * (y < 0).float()
+    tr = (x >= 0).float() * (y < 0).float()
+    bl = (x < 0).float() * (y >= 0).float()
+    br = (x >= 0).float() * (y >= 0).float()
 
-    # Stack and normalize to [-1, 1]
-    img = torch.stack([red, green, blue], dim=0)  # (3, H, W)
+    pattern = (
+        tl * zone_plate +
+        tr * checker * 0.5 +
+        bl * star * 0.5 +
+        br * (0.3 * rings + 0.3 * fine_lines)
+    )
+
+    # Add some smooth gradient variation for color
+    red = 0.5 + pattern * 0.4 + 0.1 * x
+    green = 0.5 + pattern * 0.35 - 0.05 * y
+    blue = 0.5 + pattern * 0.3 + 0.05 * (x + y)
+
+    img = torch.stack([red, green, blue], dim=0)
     img = torch.clamp(img, 0, 1)
     img = img * 2 - 1  # Normalize to [-1, 1]
 
-    return img.unsqueeze(0)  # (1, 3, H, W)
+    return img.unsqueeze(0)
 
 
 def _load_image_from_url(
@@ -243,7 +289,7 @@ def _load_image_from_url(
 
     except Exception as e:
         logger.warning(f"Failed to load image from URL: {e}. Using synthetic image.")
-        return _generate_synthetic_face(size, device, dtype)
+        return _generate_synthetic_image(size, device, dtype)
 
 
 def _load_image_from_file(
@@ -267,7 +313,7 @@ def _load_image_from_file(
 
     except Exception as e:
         logger.warning(f"Failed to load image from file: {e}. Using synthetic image.")
-        return _generate_synthetic_face(size, device, dtype)
+        return _generate_synthetic_image(size, device, dtype)
 
 
 def tensor_to_image(tensor: Tensor) -> np.ndarray:
