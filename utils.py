@@ -86,12 +86,9 @@ def setup_logging(level: str = "INFO", log_file: Optional[Union[str, Path]] = No
 
     # Configure root logger
     root_logger = logging.getLogger()
-    root_logger.setLevel(log_level)
-
-    # Remove existing handlers to avoid duplicates on re-init
     root_logger.handlers.clear()
 
-    # Console handler
+    # Console handler (respects user-specified level)
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
     console_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
@@ -105,7 +102,16 @@ def setup_logging(level: str = "INFO", log_file: Optional[Union[str, Path]] = No
         file_handler.setLevel(logging.DEBUG)  # Always capture DEBUG to file
         file_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
         root_logger.addHandler(file_handler)
-        root_logger.info(f"Logging to file: {log_path}")
+
+    # Root logger must be set to the most permissive level across all
+    # handlers, otherwise it gates messages before they reach handlers.
+    if log_file is not None:
+        root_logger.setLevel(logging.DEBUG)
+    else:
+        root_logger.setLevel(log_level)
+
+    if log_file is not None:
+        root_logger.info(f"Logging to file: {log_path} (DEBUG level)")
 
 
 def get_device(device_str: str = "cuda") -> torch.device:
