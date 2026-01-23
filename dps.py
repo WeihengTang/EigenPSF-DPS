@@ -156,28 +156,29 @@ class EigenPSFDPSPipeline:
     ) -> Tuple[Tensor, float]:
         """Compute gradient of measurement likelihood w.r.t. x_t.
 
-        Computes: ∇_{x_t} ||y - A(x̂_0(x_t))||²
+        Following the DPS paper (Chung et al., 2022), we compute:
+            ∇_{x_t} ||y - A(x̂_0(x_t))||₂
+
+        Using the L2 norm (not squared) naturally normalizes the gradient
+        by the residual magnitude, preventing gradient explosion.
 
         Args:
-            x_t: Noisy image at timestep t (requires_grad must be True)
+            x_t: Noisy image at timestep t
             y: Measurement (blurred + noisy image)
             t: Current timestep
 
         Returns:
-            Tuple of (gradient tensor, loss value)
+            Tuple of (gradient tensor, loss value as MSE for logging)
         """
-        # Ensure x_t requires grad
         x_t_var = x_t.detach().clone().requires_grad_(True)
 
-        # Predict noise
         with torch.enable_grad():
-            # Get timestep tensor
             timestep = torch.tensor([t], device=self.device, dtype=torch.long)
 
             # Predict noise using UNet
             noise_pred = self.unet(x_t_var, timestep).sample
 
-            # Tweedie estimate
+            # Tweedie estimate of clean image
             x_0_hat = self.tweedie_estimate(x_t_var, noise_pred, t)
 
             # Clamp to valid range for stability
@@ -186,13 +187,18 @@ class EigenPSFDPSPipeline:
             # Apply blur operator
             y_hat = self.blur_operator(x_0_hat_clamped)
 
-            # Compute MSE loss
-            loss = torch.sum((y - y_hat) ** 2)
+            # Compute L2 norm of residual (not squared!)
+            # This normalizes the gradient by 1/||r|| automatically,
+            # preventing magnitude explosion for large images.
+            residual = y - y_hat
+            norm_residual = torch.norm(residual)
 
-            # Compute gradient
-            grad = torch.autograd.grad(loss, x_t_var)[0]
+            # Compute gradient of ||y - A(x̂₀)||₂ w.r.t. x_t
+            grad = torch.autograd.grad(norm_residual, x_t_var)[0]
 
-        return grad, loss.item()
+        # Return MSE for human-readable logging
+        mse = (residual.detach() ** 2).mean().item()
+        return grad, mse
 
     def get_step_size(
         self,

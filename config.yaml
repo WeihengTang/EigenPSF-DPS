@@ -55,7 +55,7 @@ physics:
 # -----------------------------------------------------------------------------
 dps:
   # Guidance parameters
-  step_size: 100.0                 # Gradient scale (zeta) for likelihood guidance
+  step_size: 0.5                   # Gradient scale (zeta) for likelihood guidance
   step_size_schedule: "constant"   # "constant", "linear_decay", or "sqrt_decay"
 
   # Sampling parameters
@@ -63,7 +63,7 @@ dps:
   skip_steps: 0                    # Steps to skip (0 = use all steps)
 
   # Gradient clipping for stability
-  gradient_clip: 1.0               # Max gradient norm (0 = no clipping)
+  gradient_clip: 0.0               # Max gradient norm (0 = no clipping)
 
   # Whether to use gradient checkpointing (saves memory)
   gradient_checkpointing: false

@@ -388,6 +388,15 @@ def main() -> int:
     )
     logger.info(f"Image shape: {clean_image.shape}")
 
+    # Warn about prior mismatch
+    model_id = config["model"].get("model_id", "google/ddpm-celebahq-256")
+    image_source = config["data"].get("image_source", "sample")
+    if "celeba" in model_id.lower() and image_source == "sample":
+        logger.warning(
+            "Prior mismatch: using CelebA-HQ face model with non-face image. "
+            "For best results, provide a face image with --image /path/to/face.jpg"
+        )
+
     # Save clean image
     save_image(clean_image, output_dir / "images" / "clean.png")
 
