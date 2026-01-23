@@ -72,17 +72,40 @@ def save_config(config: Dict[str, Any], save_path: Union[str, Path]) -> None:
     logger.info(f"Configuration saved to: {save_path}")
 
 
-def setup_logging(level: str = "INFO") -> None:
-    """Setup logging configuration.
+def setup_logging(level: str = "INFO", log_file: Optional[Union[str, Path]] = None) -> None:
+    """Setup logging configuration with console and optional file output.
 
     Args:
         level: Logging level (DEBUG, INFO, WARNING, ERROR)
+        log_file: Optional path to log file. If provided, all output is
+                  also written to this file.
     """
-    logging.basicConfig(
-        level=getattr(logging, level.upper()),
-        format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
+    log_level = getattr(logging, level.upper())
+    log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
+    date_format = "%Y-%m-%d %H:%M:%S"
+
+    # Configure root logger
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+
+    # Remove existing handlers to avoid duplicates on re-init
+    root_logger.handlers.clear()
+
+    # Console handler
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(log_level)
+    console_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
+    root_logger.addHandler(console_handler)
+
+    # File handler (if log_file specified)
+    if log_file is not None:
+        log_path = Path(log_file)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_path, mode="w")
+        file_handler.setLevel(logging.DEBUG)  # Always capture DEBUG to file
+        file_handler.setFormatter(logging.Formatter(log_format, datefmt=date_format))
+        root_logger.addHandler(file_handler)
+        root_logger.info(f"Logging to file: {log_path}")
 
 
 def get_device(device_str: str = "cuda") -> torch.device:

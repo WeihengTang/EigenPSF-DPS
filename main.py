@@ -37,7 +37,7 @@ import matplotlib.pyplot as plt
 
 # Local imports
 from physics import create_sv_blur_system, EigenPSFDecomposition, SVBlurOperator, TrueSVBlurOperator
-from dps import create_dps_pipeline, download_model, EigenPSFDPSPipeline
+from dps import create_dps_pipeline, download_model, DPSResult, EigenPSFDPSPipeline
 from utils import (
     load_config,
     save_config,
@@ -274,26 +274,18 @@ def run_dps_restoration(
         output_dir: Output directory for intermediates
 
     Returns:
-        Tuple of (restored image, intermediate images, step numbers)
+        DPSResult containing restored image and full diagnostics
     """
     dps_config = config["dps"]
     output_config = config["output"]
 
-    # Lists to store intermediates
-    intermediates: List[Tensor] = []
-    step_numbers: List[int] = []
-
     def callback(step: int, x_t: Tensor, loss: float) -> None:
         """Callback for saving intermediate results."""
-        intermediates.append(x_t.cpu())
-        step_numbers.append(step)
-
         if output_config.get("save_intermediate", True):
             save_image(
                 x_t,
                 output_dir / "intermediates" / f"step_{step:04d}.png"
             )
-            logger.debug(f"Step {step}: loss = {loss:.4f}")
 
     # Create random generator for reproducibility
     generator = torch.Generator(device=pipeline.device)
@@ -301,7 +293,7 @@ def run_dps_restoration(
 
     # Run DPS
     logger.info("Starting DPS restoration...")
-    restored, _ = pipeline(
+    result = pipeline(
         y=measurement,
         num_inference_steps=dps_config.get("num_inference_steps", 1000),
         step_size=dps_config.get("step_size", 100.0),
@@ -314,7 +306,10 @@ def run_dps_restoration(
         show_progress=config["logging"].get("progress_bar", True),
     )
 
-    return restored, intermediates, step_numbers
+    # Save diagnostics
+    result.save_diagnostics(output_dir / "diagnostics.json")
+
+    return result
 
 
 def main() -> int:
@@ -368,6 +363,11 @@ def main() -> int:
 
     # Setup output directory
     output_dir = setup_output_directory(config)
+
+    # Re-initialize logging with file output now that output_dir exists
+    log_file = output_dir / "run.log"
+    setup_logging(config["logging"].get("level", "INFO"), log_file=log_file)
+    logger.info(f"All output logged to: {log_file}")
 
     # Save configuration to output directory
     save_config(config, output_dir / "config.yaml")
@@ -461,12 +461,10 @@ def main() -> int:
     # =========================================================================
     # Step 5: Run DPS restoration
     # =========================================================================
-    restored, intermediates, step_numbers = run_dps_restoration(
-        pipeline, measurement, config, output_dir
-    )
+    result = run_dps_restoration(pipeline, measurement, config, output_dir)
 
     # Save restored image
-    save_image(restored, output_dir / "images" / "restored.png")
+    save_image(result.restored, output_dir / "images" / "restored.png")
 
     # =========================================================================
     # Step 6: Compute and display metrics
@@ -474,7 +472,7 @@ def main() -> int:
     logger.info("Computing quality metrics...")
     metrics = compute_metrics(
         clean=clean_image,
-        restored=restored,
+        restored=result.restored,
         blurred=measurement,
     )
     print_metrics(metrics)
@@ -497,20 +495,49 @@ def main() -> int:
         fig = visualize_results(
             clean=clean_image,
             blurred=measurement,
-            restored=restored,
+            restored=result.restored,
             save_path=output_dir / "images" / "comparison.png",
             title=f"EigenPSF-DPS (PSNR: {metrics['psnr_restored']:.2f} dB, SSIM: {metrics['ssim_restored']:.4f})",
         )
         plt.close(fig)
 
         # Intermediate results
-        if intermediates:
+        if result.intermediates:
             fig = visualize_intermediate_results(
-                intermediates=intermediates,
-                steps=step_numbers,
+                intermediates=result.intermediates,
+                steps=[result.timesteps[i] for i in range(0, len(result.timesteps),
+                       max(1, len(result.timesteps) // len(result.intermediates)))][:len(result.intermediates)],
                 save_path=output_dir / "images" / "progress.png",
             )
             plt.close(fig)
+
+        # Loss curve
+        if result.loss_history:
+            fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+            axes[0].semilogy(result.timesteps, result.loss_history)
+            axes[0].set_xlabel("Timestep t")
+            axes[0].set_ylabel("MSE Loss")
+            axes[0].set_title("Measurement Consistency Loss")
+            axes[0].invert_xaxis()
+            axes[0].grid(True, alpha=0.3)
+
+            axes[1].semilogy(result.timesteps, result.grad_norm_history)
+            axes[1].set_xlabel("Timestep t")
+            axes[1].set_ylabel("Gradient Norm")
+            axes[1].set_title("Likelihood Gradient Norm")
+            axes[1].invert_xaxis()
+            axes[1].grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            fig.savefig(output_dir / "images" / "loss_curve.png", dpi=150, bbox_inches="tight")
+            plt.close(fig)
+            logger.info(f"Loss curve saved to: {output_dir / 'images' / 'loss_curve.png'}")
+
+    # =========================================================================
+    # Step 8: Comet ML logging (optional)
+    # =========================================================================
+    _log_to_comet(config, metrics, result, output_dir)
 
     # =========================================================================
     # Summary
@@ -521,10 +548,86 @@ def main() -> int:
     logger.info(f"  Output directory: {output_dir}")
     logger.info(f"  Restored PSNR: {metrics['psnr_restored']:.2f} dB (improvement: {metrics.get('psnr_improvement', 0):.2f} dB)")
     logger.info(f"  Restored SSIM: {metrics['ssim_restored']:.4f} (improvement: {metrics.get('ssim_improvement', 0):.4f})")
+    logger.info(f"  Final loss: {result.loss_history[-1]:.6f}")
+    logger.info(f"  Min loss: {min(result.loss_history):.6f}")
     logger.info("=" * 60)
     logger.info("Done!")
 
     return 0
+
+
+def _log_to_comet(
+    config: Dict[str, Any],
+    metrics: Dict[str, float],
+    result: DPSResult,
+    output_dir: Path,
+) -> None:
+    """Log experiment results to Comet ML if available.
+
+    Comet ML integration is optional. Install with: pip install comet_ml
+    Set your API key via environment variable: COMET_API_KEY
+
+    Args:
+        config: Configuration dictionary
+        metrics: Quality metrics
+        result: DPS result with loss history
+        output_dir: Output directory containing images
+    """
+    try:
+        import comet_ml
+    except ImportError:
+        logger.debug("Comet ML not installed. Skipping experiment tracking.")
+        return
+
+    api_key = os.environ.get("COMET_API_KEY")
+    if not api_key:
+        logger.debug("COMET_API_KEY not set. Skipping Comet ML logging.")
+        return
+
+    try:
+        experiment = comet_ml.Experiment(
+            api_key=api_key,
+            project_name=os.environ.get("COMET_PROJECT_NAME", "eigenpsf-dps"),
+            workspace=os.environ.get("COMET_WORKSPACE"),
+            auto_metric_logging=False,
+            auto_param_logging=False,
+        )
+
+        # Log hyperparameters
+        experiment.log_parameters({
+            "blur_mode": config["physics"].get("blur_mode"),
+            "n_eigen_psfs": config["physics"].get("n_eigen_psfs"),
+            "sigma_noise": config["physics"].get("sigma_noise"),
+            "step_size": config["dps"].get("step_size"),
+            "num_inference_steps": config["dps"].get("num_inference_steps"),
+            "gradient_clip": config["dps"].get("gradient_clip"),
+            "step_size_schedule": config["dps"].get("step_size_schedule"),
+            "img_size": config["data"].get("img_size"),
+            "seed": config.get("seed"),
+        })
+
+        # Log final metrics
+        experiment.log_metrics(metrics)
+
+        # Log loss curve as time series
+        for i, (t, loss, grad_norm) in enumerate(zip(
+            result.timesteps, result.loss_history, result.grad_norm_history
+        )):
+            experiment.log_metric("loss", loss, step=i, epoch=t)
+            experiment.log_metric("grad_norm", grad_norm, step=i, epoch=t)
+            experiment.log_metric("step_size", result.step_size_history[i], step=i, epoch=t)
+
+        # Log images
+        for img_name in ["clean.png", "blurred.png", "restored.png", "comparison.png", "loss_curve.png"]:
+            img_path = output_dir / "images" / img_name
+            if img_path.exists():
+                experiment.log_image(str(img_path), name=img_name.replace(".png", ""))
+
+        experiment.end()
+        logger.info(f"Comet ML experiment logged: {experiment.get_key()}")
+
+    except Exception as e:
+        logger.warning(f"Comet ML logging failed: {e}")
 
 
 if __name__ == "__main__":

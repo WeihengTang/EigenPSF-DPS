@@ -22,8 +22,11 @@ Author: EigenPSF-DPS Research Team
 
 from __future__ import annotations
 
+import json
 import logging
-from typing import Optional, Callable, List, Tuple, Literal
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Optional, Callable, List, Tuple, Literal, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -37,6 +40,47 @@ from physics import SVBlurOperator
 
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class DPSResult:
+    """Container for DPS sampling results and diagnostics.
+
+    Attributes:
+        restored: Final restored image tensor (B, C, H, W)
+        intermediates: List of intermediate x_0 estimates
+        loss_history: Per-step MSE loss values
+        grad_norm_history: Per-step gradient norms
+        step_size_history: Per-step effective step sizes
+        timesteps: Timestep values corresponding to each entry
+    """
+    restored: Tensor
+    intermediates: List[Tensor] = field(default_factory=list)
+    loss_history: List[float] = field(default_factory=list)
+    grad_norm_history: List[float] = field(default_factory=list)
+    step_size_history: List[float] = field(default_factory=list)
+    timesteps: List[int] = field(default_factory=list)
+
+    def save_diagnostics(self, path: Path) -> None:
+        """Save loss and gradient histories to JSON for analysis.
+
+        Args:
+            path: Output file path (.json)
+        """
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        data = {
+            "timesteps": self.timesteps,
+            "loss": self.loss_history,
+            "grad_norm": self.grad_norm_history,
+            "step_size": self.step_size_history,
+        }
+
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+
+        logger.info(f"DPS diagnostics saved to: {path}")
 
 
 class EigenPSFDPSPipeline:
@@ -192,7 +236,7 @@ class EigenPSFDPSPipeline:
         callback: Optional[Callable[[int, Tensor, float], None]] = None,
         callback_steps: int = 100,
         show_progress: bool = True,
-    ) -> Tuple[Tensor, List[Tensor]]:
+    ) -> DPSResult:
         """Run DPS sampling for SV deconvolution.
 
         Args:
@@ -208,7 +252,7 @@ class EigenPSFDPSPipeline:
             show_progress: Whether to show progress bar
 
         Returns:
-            Tuple of (final reconstruction, list of intermediate results)
+            DPSResult containing restored image and full diagnostics
         """
         batch_size = y.shape[0]
         img_shape = y.shape
@@ -224,8 +268,12 @@ class EigenPSFDPSPipeline:
         # Initialize x_T from pure noise
         x_t = randn_tensor(img_shape, generator=generator, device=self.device, dtype=self.dtype)
 
-        # Store intermediate results
+        # Tracking lists for diagnostics
         intermediates: List[Tensor] = []
+        loss_history: List[float] = []
+        grad_norm_history: List[float] = []
+        step_size_history: List[float] = []
+        timestep_history: List[int] = []
 
         # Progress bar
         progress_bar = tqdm(
@@ -241,37 +289,50 @@ class EigenPSFDPSPipeline:
             # 1. Compute measurement likelihood gradient
             grad, loss = self.compute_likelihood_gradient(x_t, y, t_int)
 
-            # 2. Gradient clipping for stability
-            if gradient_clip > 0:
-                grad_norm = grad.norm()
-                if grad_norm > gradient_clip:
-                    grad = grad * (gradient_clip / grad_norm)
+            # 2. Compute gradient norm before clipping
+            grad_norm = grad.norm().item()
 
-            # 3. Get current step size
+            # 3. Gradient clipping for stability
+            if gradient_clip > 0 and grad_norm > gradient_clip:
+                grad = grad * (gradient_clip / grad_norm)
+
+            # 4. Get current step size
             zeta = self.get_step_size(
                 t_int, step_size, step_size_schedule, num_inference_steps
             )
 
-            # 4. Standard DDPM prediction (without gradient)
+            # 5. Standard DDPM prediction (without gradient)
             timestep = torch.tensor([t_int], device=self.device, dtype=torch.long)
             noise_pred = self.unet(x_t, timestep).sample
 
-            # 5. Scheduler step (standard diffusion)
+            # 6. Scheduler step (standard diffusion)
             scheduler_output = self.scheduler.step(
                 noise_pred, t_int, x_t, generator=generator
             )
             x_t_standard = scheduler_output.prev_sample
 
-            # 6. Apply DPS gradient guidance
+            # 7. Apply DPS gradient guidance
             # x_{t-1} = Standard_Step(x_t) - zeta * grad
             x_t = x_t_standard - zeta * grad
+
+            # Record diagnostics
+            loss_history.append(loss)
+            grad_norm_history.append(grad_norm)
+            step_size_history.append(zeta)
+            timestep_history.append(t_int)
+
+            # Log every 50 steps at DEBUG level
+            if i % 50 == 0:
+                logger.debug(
+                    f"Step {i:4d} | t={t_int:4d} | loss={loss:.6f} | "
+                    f"grad_norm={grad_norm:.6f} | zeta={zeta:.2f}"
+                )
 
             # Update progress bar
             progress_bar.set_postfix({"loss": f"{loss:.4f}", "zeta": f"{zeta:.2f}"})
 
             # Callback and intermediate saving
             if callback is not None and (i % callback_steps == 0 or i == len(timesteps) - 1):
-                # Get clean estimate for visualization
                 x_0_hat = self.tweedie_estimate(x_t, noise_pred, t_int)
                 x_0_hat_clamped = torch.clamp(x_0_hat, -1.0, 1.0)
                 intermediates.append(x_0_hat_clamped.cpu())
@@ -283,7 +344,21 @@ class EigenPSFDPSPipeline:
         x_0_final = self.tweedie_estimate(x_t, final_noise_pred, 0)
         x_0_final = torch.clamp(x_0_final, -1.0, 1.0)
 
-        return x_0_final, intermediates
+        # Log final summary
+        logger.info(
+            f"DPS complete | final_loss={loss_history[-1]:.6f} | "
+            f"min_loss={min(loss_history):.6f} | "
+            f"mean_grad_norm={sum(grad_norm_history)/len(grad_norm_history):.6f}"
+        )
+
+        return DPSResult(
+            restored=x_0_final,
+            intermediates=intermediates,
+            loss_history=loss_history,
+            grad_norm_history=grad_norm_history,
+            step_size_history=step_size_history,
+            timesteps=timestep_history,
+        )
 
 
 class EigenPSFDPSPipelineV2(EigenPSFDPSPipeline):
@@ -331,30 +406,31 @@ class EigenPSFDPSPipelineV2(EigenPSFDPSPipeline):
         callback: Optional[Callable[[int, Tensor, float], None]] = None,
         callback_steps: int = 100,
         show_progress: bool = True,
-    ) -> Tuple[Tensor, List[Tensor]]:
+    ) -> DPSResult:
         """Run enhanced DPS sampling.
 
         Additional Args:
             use_momentum: Whether to apply momentum to gradients
             adaptive_step_size: Whether to adapt step size based on gradient norm
         """
-        # Reset momentum buffer
         self._grad_buffer = None
 
         batch_size = y.shape[0]
         img_shape = y.shape
 
-        # Set scheduler timesteps
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
         timesteps = self.scheduler.timesteps
 
         if skip_steps > 0:
             timesteps = timesteps[skip_steps:]
 
-        # Initialize x_T from pure noise
         x_t = randn_tensor(img_shape, generator=generator, device=self.device, dtype=self.dtype)
 
         intermediates: List[Tensor] = []
+        loss_history: List[float] = []
+        grad_norm_history: List[float] = []
+        step_size_history: List[float] = []
+        timestep_history: List[int] = []
 
         progress_bar = tqdm(
             enumerate(timesteps),
@@ -368,37 +444,40 @@ class EigenPSFDPSPipelineV2(EigenPSFDPSPipeline):
         for i, t in progress_bar:
             t_int = t.item() if isinstance(t, Tensor) else t
 
-            # Compute gradient
             grad, loss = self.compute_likelihood_gradient(x_t, y, t_int)
 
-            # Apply momentum
             if use_momentum:
                 grad = self._apply_momentum(grad)
 
-            # Gradient clipping
-            if gradient_clip > 0:
-                grad_norm = grad.norm()
-                if grad_norm > gradient_clip:
-                    grad = grad * (gradient_clip / grad_norm)
+            grad_norm = grad.norm().item()
 
-            # Adaptive step size
+            if gradient_clip > 0 and grad_norm > gradient_clip:
+                grad = grad * (gradient_clip / grad_norm)
+
             zeta = self.get_step_size(t_int, step_size, step_size_schedule, num_inference_steps)
 
-            if adaptive_step_size:
-                # Reduce step size if loss is increasing
-                if loss > prev_loss * 1.5:
-                    zeta *= 0.5
-                prev_loss = loss
+            if adaptive_step_size and loss > prev_loss * 1.5:
+                zeta *= 0.5
+            prev_loss = loss
 
-            # Standard DDPM step
             timestep = torch.tensor([t_int], device=self.device, dtype=torch.long)
             noise_pred = self.unet(x_t, timestep).sample
 
             scheduler_output = self.scheduler.step(noise_pred, t_int, x_t, generator=generator)
             x_t_standard = scheduler_output.prev_sample
 
-            # DPS update
             x_t = x_t_standard - zeta * grad
+
+            loss_history.append(loss)
+            grad_norm_history.append(grad_norm)
+            step_size_history.append(zeta)
+            timestep_history.append(t_int)
+
+            if i % 50 == 0:
+                logger.debug(
+                    f"Step {i:4d} | t={t_int:4d} | loss={loss:.6f} | "
+                    f"grad_norm={grad_norm:.6f} | zeta={zeta:.2f}"
+                )
 
             progress_bar.set_postfix({"loss": f"{loss:.4f}", "zeta": f"{zeta:.2f}"})
 
@@ -408,13 +487,25 @@ class EigenPSFDPSPipelineV2(EigenPSFDPSPipeline):
                 intermediates.append(x_0_hat_clamped.cpu())
                 callback(i, x_0_hat_clamped, loss)
 
-        # Final estimate
         final_timestep = torch.tensor([0], device=self.device, dtype=torch.long)
         final_noise_pred = self.unet(x_t, final_timestep).sample
         x_0_final = self.tweedie_estimate(x_t, final_noise_pred, 0)
         x_0_final = torch.clamp(x_0_final, -1.0, 1.0)
 
-        return x_0_final, intermediates
+        logger.info(
+            f"DPS-V2 complete | final_loss={loss_history[-1]:.6f} | "
+            f"min_loss={min(loss_history):.6f} | "
+            f"mean_grad_norm={sum(grad_norm_history)/len(grad_norm_history):.6f}"
+        )
+
+        return DPSResult(
+            restored=x_0_final,
+            intermediates=intermediates,
+            loss_history=loss_history,
+            grad_norm_history=grad_norm_history,
+            step_size_history=step_size_history,
+            timesteps=timestep_history,
+        )
 
 
 def load_pretrained_diffusion_model(
