@@ -8,12 +8,12 @@ the EigenPSF decomposition framework.
 Mathematical Foundation:
     Forward Model: y = A(x) + n
 
-    Where A is approximated via EigenPSF decomposition:
-        A(x) ≈ Σ_{k=1}^K C_k ⊙ (x * B_k)
+    Where A is approximated via EigenPSF decomposition (scattering formulation):
+        A(x) ≈ Σ_{k=1}^K (C_k ⊙ x) * B_k
 
     - B_k: Spatially invariant basis kernels (EigenPSFs)
     - C_k: Spatially varying coefficient maps
-    - *: Convolution
+    - *: Convolution (scatters each pixel's weighted contribution)
     - ⊙: Element-wise multiplication
 
 Author: EigenPSF-DPS Research Team
@@ -381,14 +381,18 @@ def compute_eigen_decomposition(
 class SVBlurOperator(nn.Module):
     """Differentiable Spatially Varying Blur Operator using EigenPSF decomposition.
 
-    Implements the forward model:
-        A(x) = Σ_{k=1}^K C_k ⊙ (x * B_k)
+    Implements the forward model (scattering formulation):
+        A(x) = Σ_{k=1}^K (C_k ⊙ x) * B_k
 
     where:
         - B_k: Basis kernels (EigenPSFs) of shape (K, 1, kH, kW)
         - C_k: Coefficient maps of shape (K, H, W)
-        - *: Convolution
-        - ⊙: Element-wise multiplication
+        - ⊙: Element-wise multiplication (weight input by local coefficients)
+        - *: Convolution (scatter each pixel's weighted contribution)
+
+    This scattering formulation is physically correct: each input pixel's
+    contribution is first weighted by the local coefficient, then scattered
+    according to the basis kernel.
 
     Args:
         decomposition: EigenPSFDecomposition containing basis kernels and coefficients
@@ -412,7 +416,10 @@ class SVBlurOperator(nn.Module):
         self.padding_mode = padding_mode
 
     def forward(self, x: Tensor) -> Tensor:
-        """Apply spatially varying blur to input image.
+        """Apply spatially varying blur to input image (scattering formulation).
+
+        Scattering: each input pixel's contribution is first weighted by the
+        local coefficient, then scattered/convolved with the basis kernel.
 
         Args:
             x: Input tensor of shape (B, C, H, W)
@@ -421,12 +428,6 @@ class SVBlurOperator(nn.Module):
             Blurred tensor of shape (B, C, H, W)
         """
         B, C, H, W = x.shape
-
-        # Apply reflection padding
-        if self.padding > 0:
-            x_padded = F.pad(x, [self.padding] * 4, mode=self.padding_mode)
-        else:
-            x_padded = x
 
         # Initialize output
         output = torch.zeros_like(x)
@@ -439,20 +440,27 @@ class SVBlurOperator(nn.Module):
             # Get k-th coefficient map: (1, H, W) -> (1, 1, H, W)
             coeff_k = self.coefficient_maps[k:k+1].unsqueeze(0)
 
-            # Convolve each channel with the basis kernel
+            # Step 1: Element-wise product - weight input by local coefficients
+            weighted_x = coeff_k * x  # (B, C, H, W)
+
+            # Apply reflection padding after weighting
+            if self.padding > 0:
+                weighted_x_padded = F.pad(weighted_x, [self.padding] * 4, mode=self.padding_mode)
+            else:
+                weighted_x_padded = weighted_x
+
+            # Step 2: Convolve - scatter each pixel's weighted contribution
             # Process all channels together using groups
             kernel_expanded = kernel_k.expand(C, 1, -1, -1)  # (C, 1, kH, kW)
 
             conv_result = F.conv2d(
-                x_padded,
+                weighted_x_padded,
                 kernel_expanded,
                 padding=0,
                 groups=C,
             )  # (B, C, H, W)
 
-            # Apply spatially varying coefficients
-            # coeff_k broadcasts over batch and channel dimensions
-            output = output + coeff_k * conv_result
+            output = output + conv_result
 
         return output
 
@@ -460,7 +468,8 @@ class SVBlurOperator(nn.Module):
         """Apply adjoint (transpose) of the blur operator.
 
         The adjoint of the SV blur is needed for some optimization algorithms.
-        For our decomposition: A^T(y) = Σ_k (C_k ⊙ y) * B_k^T
+        For scattering formulation A(x) = Σ_k (C_k ⊙ x) * B_k,
+        the adjoint is gathering: A^T(y) = Σ_k C_k ⊙ (y * B_k^T)
         where B_k^T is the flipped kernel.
 
         Args:
@@ -471,34 +480,32 @@ class SVBlurOperator(nn.Module):
         """
         B, C, H, W = y.shape
 
+        # Apply reflection padding to input
+        if self.padding > 0:
+            y_padded = F.pad(y, [self.padding] * 4, mode=self.padding_mode)
+        else:
+            y_padded = y
+
         # Initialize output
         output = torch.zeros_like(y)
 
         for k in range(self.n_components):
-            # Get coefficient map and apply to input
-            coeff_k = self.coefficient_maps[k:k+1].unsqueeze(0)  # (1, 1, H, W)
-            weighted = coeff_k * y  # (B, C, H, W)
-
-            # Apply padding
-            if self.padding > 0:
-                weighted_padded = F.pad(weighted, [self.padding] * 4, mode=self.padding_mode)
-            else:
-                weighted_padded = weighted
-
             # Flip kernel for adjoint (transpose convolution)
             kernel_k = self.basis_kernels[k:k+1]
             kernel_flipped = torch.flip(kernel_k, dims=[-2, -1])
             kernel_expanded = kernel_flipped.expand(C, 1, -1, -1)
 
-            # Convolve with flipped kernel
+            # Step 1: Convolve with flipped kernel (gathering)
             conv_result = F.conv2d(
-                weighted_padded,
+                y_padded,
                 kernel_expanded,
                 padding=0,
                 groups=C,
-            )
+            )  # (B, C, H, W)
 
-            output = output + conv_result
+            # Step 2: Element-wise product with coefficient map
+            coeff_k = self.coefficient_maps[k:k+1].unsqueeze(0)  # (1, 1, H, W)
+            output = output + coeff_k * conv_result
 
         return output
 
