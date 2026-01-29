@@ -114,8 +114,11 @@ python main.py
 # Use defocus blur instead of motion blur
 python main.py --blur_mode defocus
 
+# Use random IID blur (drastically varying PSFs between pixels)
+python main.py --blur_mode random_iid --n_eigen_psfs 15
+
 # Adjust DPS step size (higher = stronger guidance)
-python main.py --step_size 50.0
+python main.py --step_size 1.0
 
 # Use more EigenPSF components for better approximation
 python main.py --n_eigen_psfs 10
@@ -139,8 +142,11 @@ conda activate eigenpsf-dps
 conda install pytorch torchvision pytorch-cuda=11.8 -c pytorch -c nvidia -y
 pip install -r requirements.txt
 
-# Run deconvolution
-python main.py --blur_mode motion --step_size 100.0 --n_eigen_psfs 5
+# Run deconvolution with smooth blur
+python main.py --blur_mode defocus --step_size 0.5 --n_eigen_psfs 5
+
+# Run deconvolution with random IID blur (stress test)
+python main.py --blur_mode random_iid --step_size 0.5 --n_eigen_psfs 20
 
 # Results will be saved to ./results/run_YYYYMMDD_HHMMSS/
 ```
@@ -163,16 +169,19 @@ model:
 
 # Physics / Blur simulation
 physics:
-  blur_mode: "motion"        # "motion", "defocus", or "mixed"
+  blur_mode: "motion"        # "motion", "defocus", "mixed", or "random_iid"
   kernel_size: 21            # PSF kernel size
-  n_eigen_psfs: 5            # Number of PCA components
+  grid_size: 8               # PSF sampling grid (8 for smooth, 64 for random_iid)
+  n_eigen_psfs: 5            # Number of PCA components (5 for smooth, 15+ for random_iid)
   sigma_noise: 0.01          # Measurement noise level
+  random_iid:
+    grid_size: 64            # Dense grid for near-pixel PSF variation
 
 # DPS parameters
 dps:
-  step_size: 100.0           # Gradient guidance scale (ζ)
+  step_size: 0.5             # Gradient guidance scale (ζ)
   num_inference_steps: 1000  # Diffusion steps
-  gradient_clip: 1.0         # Gradient clipping for stability
+  gradient_clip: 0.0         # Gradient clipping (0 = disabled)
 
 # Output
 output:
@@ -181,12 +190,26 @@ output:
   intermediate_freq: 100
 ```
 
+### Blur Modes
+
+| Mode | Description | PSF Variation | Recommended `n_eigen_psfs` |
+|------|-------------|---------------|---------------------------|
+| `motion` | Smoothly varying motion blur | Gradual (direction/length change slowly) | 5 |
+| `defocus` | Smoothly varying defocus | Gradual (radius increases from center) | 5 |
+| `mixed` | Alternating motion and defocus | Moderate | 5-10 |
+| `random_iid` | Near-IID random PSFs | Drastic (completely different neighbors) | 15-25 |
+
+The `random_iid` mode stress-tests the EigenPSF decomposition by generating independently sampled PSFs at each grid point:
+- Random motion blur (any angle, random length)
+- Random defocus (random radius)
+- Random asymmetric Gaussian (random orientation, aspect ratio, center offset)
+
 ### Key Parameters
 
 | Parameter | Description | Recommended Range |
 |-----------|-------------|-------------------|
-| `step_size` | DPS guidance strength | 10.0 - 200.0 |
-| `n_eigen_psfs` | Number of basis kernels | 3 - 15 |
+| `step_size` | DPS guidance strength | 0.1 - 2.0 |
+| `n_eigen_psfs` | Number of basis kernels | 5-15 (smooth), 15-25 (random_iid) |
 | `sigma_noise` | Noise standard deviation | 0.001 - 0.05 |
 | `num_inference_steps` | Diffusion sampling steps | 100 - 1000 |
 
@@ -320,10 +343,12 @@ Other options:
 - Try alternative model: `--model_id "google/ddpm-cifar10-32"`
 
 ### Poor Reconstruction Quality
-- Increase `step_size` for stronger guidance
-- Increase `n_eigen_psfs` for better blur approximation
+- Adjust `step_size`: try values in 0.1-2.0 range (lower = smoother, higher = sharper but more artifacts)
+- Increase `n_eigen_psfs` for better blur approximation (especially for `random_iid` mode)
 - Ensure `sigma_noise` matches actual noise level
 - Use full 1000 inference steps
+- Check `explained_variance_ratio` in logs — if below 90%, increase `n_eigen_psfs`
+- For `random_iid` mode, use at least 15-20 EigenPSF components
 
 ## Citation
 
