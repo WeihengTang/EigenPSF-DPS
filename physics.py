@@ -21,6 +21,7 @@ Author: EigenPSF-DPS Research Team
 
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 from typing import Tuple, Optional, Literal
@@ -28,6 +29,9 @@ from typing import Tuple, Optional, Literal
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from tqdm import tqdm
+
+logger = logging.getLogger(__name__)
 from torch import Tensor
 
 
@@ -115,6 +119,15 @@ class SVBlurSimulator:
             device=self.device, dtype=self.dtype
         )
 
+        total_kernels = self.grid_size * self.grid_size
+        logger.info(f"Generating {total_kernels} kernels ({self.grid_size}x{self.grid_size} grid, mode={mode})...")
+
+        # Use progress bar for large grids (e.g., random_iid with 64x64 = 4096 kernels)
+        show_progress = total_kernels > 100
+
+        kernel_idx = 0
+        pbar = tqdm(total=total_kernels, desc="Generating kernels", disable=not show_progress)
+
         for i in range(self.grid_size):
             for j in range(self.grid_size):
                 # Normalized position in [0, 1]
@@ -151,6 +164,11 @@ class SVBlurSimulator:
                         )
 
                 kernels[i, j] = kernel
+                kernel_idx += 1
+                pbar.update(1)
+
+        pbar.close()
+        logger.info(f"Kernel generation complete.")
 
         return kernels
 
@@ -364,6 +382,7 @@ class SVBlurSimulator:
             Interpolated kernels of shape (H, W, kH, kW)
         """
         gH, gW, kH, kW = kernel_grid.shape
+        logger.debug(f"Interpolating {gH}x{gW} kernel grid to {self.img_height}x{self.img_width} image...")
 
         # Reshape for interpolation: (kH*kW, 1, gH, gW)
         grid_flat = kernel_grid.permute(2, 3, 0, 1).reshape(kH * kW, 1, gH, gW)
@@ -411,8 +430,11 @@ def compute_eigen_decomposition(
     dtype = kernel_grid.dtype
     gH, gW, kH, kW = kernel_grid.shape
 
+    logger.info(f"Computing EigenPSF decomposition ({gH}x{gW} grid -> {n_components} components)...")
+
     # Flatten kernels: (gH * gW, kH * kW)
     kernels_flat = kernel_grid.reshape(gH * gW, kH * kW)
+    logger.debug(f"Kernel matrix shape: {kernels_flat.shape}")
 
     # Center the data (subtract mean)
     mean_kernel = kernels_flat.mean(dim=0, keepdim=True)
@@ -422,7 +444,9 @@ def compute_eigen_decomposition(
     # kernels_centered = U @ S @ V^T
     # Columns of V are principal components (basis kernels)
     # U @ S gives the coefficients
+    logger.info(f"Running SVD on {kernels_flat.shape[0]}x{kernels_flat.shape[1]} matrix...")
     U, S, Vh = torch.linalg.svd(kernels_centered, full_matrices=False)
+    logger.info("SVD complete.")
 
     # Extract top K components
     K = min(n_components, len(S))
@@ -673,6 +697,10 @@ def create_sv_blur_system(
     Returns:
         Tuple of (eigenpsf_operator, true_operator, decomposition)
     """
+    logger.info("=" * 60)
+    logger.info("Creating SV Blur System")
+    logger.info("=" * 60)
+
     # Get blur mode parameters
     blur_mode = config.get("blur_mode", "motion")
     motion_cfg = config.get("motion", {})
@@ -683,8 +711,10 @@ def create_sv_blur_system(
     if blur_mode == "random_iid":
         # Default to 64x64 grid for random_iid (can be overridden in config)
         grid_size = random_iid_cfg.get("grid_size", 64)
+        logger.info(f"Using random_iid mode with dense {grid_size}x{grid_size} grid")
     else:
         grid_size = config.get("grid_size", 8)
+        logger.info(f"Using {blur_mode} mode with {grid_size}x{grid_size} grid")
 
     # Create simulator
     simulator = SVBlurSimulator(
@@ -697,6 +727,7 @@ def create_sv_blur_system(
     )
 
     # Generate kernel grid
+    logger.info("Step 1/4: Generating kernel grid...")
     kernel_grid = simulator.simulate_sv_kernel_grid(
         mode=blur_mode,
         motion_length_range=(
@@ -711,22 +742,29 @@ def create_sv_blur_system(
     )
 
     # Interpolate to full resolution for true operator
+    logger.info("Step 2/4: Interpolating kernels to full image resolution...")
     kernel_field = simulator.interpolate_kernels_to_image(kernel_grid)
+    logger.info(f"Interpolated kernel field shape: {kernel_field.shape}")
 
     # Compute EigenPSF decomposition
     # For random_iid, recommend more components since the variation is higher
     default_n_eigen = 15 if blur_mode == "random_iid" else 5
     n_eigen = config.get("n_eigen_psfs", default_n_eigen)
+    logger.info(f"Step 3/4: Computing EigenPSF decomposition with {n_eigen} components...")
     decomposition = compute_eigen_decomposition(
         kernel_grid,
         img_height,
         img_width,
         n_components=n_eigen,
     )
+    logger.info(f"Explained variance ratio: {decomposition.explained_variance_ratio:.2%}")
 
     # Create operators
+    logger.info("Step 4/4: Creating blur operators...")
     eigenpsf_operator = SVBlurOperator(decomposition).to(device)
     true_operator = TrueSVBlurOperator(kernel_field).to(device)
+    logger.info("SV Blur System created successfully.")
+    logger.info("=" * 60)
 
     return eigenpsf_operator, true_operator, decomposition
 
