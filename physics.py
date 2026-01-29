@@ -84,7 +84,7 @@ class SVBlurSimulator:
 
     def simulate_sv_kernel_grid(
         self,
-        mode: Literal["motion", "defocus", "mixed"] = "motion",
+        mode: Literal["motion", "defocus", "mixed", "random_iid"] = "motion",
         motion_length_range: Tuple[float, float] = (5.0, 25.0),
         motion_angle_variation: float = 180.0,
         defocus_radius_range: Tuple[float, float] = (2.0, 12.0),
@@ -93,7 +93,11 @@ class SVBlurSimulator:
         """Generate a grid of spatially varying blur kernels.
 
         Args:
-            mode: Type of blur - "motion", "defocus", or "mixed"
+            mode: Type of blur:
+                - "motion": Smoothly varying motion blur (direction/length change gradually)
+                - "defocus": Smoothly varying defocus blur (radius increases from center)
+                - "mixed": Alternating motion and defocus
+                - "random_iid": Near-IID random PSFs (drastically different between neighbors)
             motion_length_range: (min, max) motion blur length in pixels
             motion_angle_variation: Angular variation in degrees
             defocus_radius_range: (min, max) defocus blur radius in pixels
@@ -126,6 +130,11 @@ class SVBlurSimulator:
                 elif mode == "defocus":
                     kernel = self._create_defocus_kernel(
                         x_pos, y_pos,
+                        defocus_radius_range
+                    )
+                elif mode == "random_iid":
+                    kernel = self._create_random_iid_kernel(
+                        motion_length_range,
                         defocus_radius_range
                     )
                 else:  # mixed
@@ -254,6 +263,88 @@ class SVBlurSimulator:
 
         # Soft disk with anti-aliasing
         kernel = torch.clamp(1.0 - (dist - radius) / 1.5, 0.0, 1.0)
+
+        # Normalize
+        kernel = kernel / (kernel.sum() + 1e-8)
+
+        return kernel
+
+    def _create_random_iid_kernel(
+        self,
+        motion_length_range: Tuple[float, float],
+        defocus_radius_range: Tuple[float, float],
+    ) -> Tensor:
+        """Create a completely random PSF kernel (IID per grid point).
+
+        Each kernel is independently sampled with random type (motion/defocus/gaussian),
+        random parameters, creating drastic variation between neighbors.
+
+        Args:
+            motion_length_range: (min, max) for motion blur length
+            defocus_radius_range: (min, max) for defocus radius
+
+        Returns:
+            Randomly generated normalized kernel
+        """
+        # Randomly choose kernel type: 0=motion, 1=defocus, 2=asymmetric gaussian
+        kernel_type = torch.randint(0, 3, (1,)).item()
+
+        if kernel_type == 0:
+            # Random motion blur: completely random angle and length
+            angle = torch.rand(1).item() * 2 * math.pi  # [0, 2π]
+            length = motion_length_range[0] + torch.rand(1).item() * (
+                motion_length_range[1] - motion_length_range[0]
+            )
+            kernel = self._motion_kernel(length, angle)
+
+        elif kernel_type == 1:
+            # Random defocus: completely random radius
+            radius = defocus_radius_range[0] + torch.rand(1).item() * (
+                defocus_radius_range[1] - defocus_radius_range[0]
+            )
+            kernel = self._disk_kernel(radius)
+
+        else:
+            # Asymmetric Gaussian blob at random offset from center
+            kernel = self._random_gaussian_kernel()
+
+        return kernel
+
+    def _random_gaussian_kernel(self) -> Tensor:
+        """Generate a random asymmetric Gaussian kernel.
+
+        Creates an elliptical Gaussian with random orientation, aspect ratio,
+        and offset from center - simulating aberrated/astigmatic PSFs.
+
+        Returns:
+            Normalized asymmetric Gaussian kernel
+        """
+        center = self.kernel_size // 2
+
+        # Random parameters
+        sigma_x = 1.5 + torch.rand(1).item() * 4.0  # [1.5, 5.5]
+        sigma_y = 1.5 + torch.rand(1).item() * 4.0  # [1.5, 5.5]
+        theta = torch.rand(1).item() * math.pi  # Rotation angle [0, π]
+        offset_x = (torch.rand(1).item() - 0.5) * 4  # [-2, 2] pixel offset
+        offset_y = (torch.rand(1).item() - 0.5) * 4  # [-2, 2] pixel offset
+
+        y, x = torch.meshgrid(
+            torch.arange(self.kernel_size, device=self.device, dtype=self.dtype),
+            torch.arange(self.kernel_size, device=self.device, dtype=self.dtype),
+            indexing="ij"
+        )
+
+        # Shift coordinates
+        x_shifted = x - center - offset_x
+        y_shifted = y - center - offset_y
+
+        # Rotate coordinates
+        cos_t, sin_t = math.cos(theta), math.sin(theta)
+        x_rot = cos_t * x_shifted + sin_t * y_shifted
+        y_rot = -sin_t * x_shifted + cos_t * y_shifted
+
+        # Asymmetric Gaussian
+        kernel = torch.exp(-0.5 * ((x_rot / sigma_x)**2 + (y_rot / sigma_y)**2))
 
         # Normalize
         kernel = kernel / (kernel.sum() + 1e-8)
@@ -582,20 +673,28 @@ def create_sv_blur_system(
     Returns:
         Tuple of (eigenpsf_operator, true_operator, decomposition)
     """
+    # Get blur mode parameters
+    blur_mode = config.get("blur_mode", "motion")
+    motion_cfg = config.get("motion", {})
+    defocus_cfg = config.get("defocus", {})
+    random_iid_cfg = config.get("random_iid", {})
+
+    # For random_iid mode, use a much denser grid to get near-pixel variation
+    if blur_mode == "random_iid":
+        # Default to 64x64 grid for random_iid (can be overridden in config)
+        grid_size = random_iid_cfg.get("grid_size", 64)
+    else:
+        grid_size = config.get("grid_size", 8)
+
     # Create simulator
     simulator = SVBlurSimulator(
         img_height=img_height,
         img_width=img_width,
         kernel_size=config.get("kernel_size", 21),
-        grid_size=config.get("grid_size", 8),
+        grid_size=grid_size,
         device=device,
         dtype=dtype,
     )
-
-    # Get blur mode parameters
-    blur_mode = config.get("blur_mode", "motion")
-    motion_cfg = config.get("motion", {})
-    defocus_cfg = config.get("defocus", {})
 
     # Generate kernel grid
     kernel_grid = simulator.simulate_sv_kernel_grid(
@@ -615,7 +714,9 @@ def create_sv_blur_system(
     kernel_field = simulator.interpolate_kernels_to_image(kernel_grid)
 
     # Compute EigenPSF decomposition
-    n_eigen = config.get("n_eigen_psfs", 5)
+    # For random_iid, recommend more components since the variation is higher
+    default_n_eigen = 15 if blur_mode == "random_iid" else 5
+    n_eigen = config.get("n_eigen_psfs", default_n_eigen)
     decomposition = compute_eigen_decomposition(
         kernel_grid,
         img_height,

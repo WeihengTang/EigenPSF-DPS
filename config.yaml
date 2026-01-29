@@ -26,7 +26,11 @@ model:
 # Physics / Blur Simulation Configuration
 # -----------------------------------------------------------------------------
 physics:
-  # Blur mode: "motion" (directional), "defocus" (circular), or "mixed"
+  # Blur mode:
+  #   "motion"     - Smoothly varying motion blur (direction changes gradually)
+  #   "defocus"    - Smoothly varying defocus (radius increases from center)
+  #   "mixed"      - Alternating motion and defocus patterns
+  #   "random_iid" - Near-IID random PSFs (drastically different between neighbors)
   blur_mode: "motion"
 
   # Spatially varying blur parameters
@@ -44,8 +48,12 @@ physics:
     min_radius: 2                  # Minimum defocus radius (pixels)
     max_radius: 12                 # Maximum defocus radius (pixels)
 
+  # Random IID blur specific parameters (near-pixel-level PSF variation)
+  random_iid:
+    grid_size: 64                  # Dense grid for IID-like variation (64x64)
+
   # EigenPSF decomposition parameters
-  n_eigen_psfs: 5                  # Number of PCA components (K)
+  n_eigen_psfs: 5                  # Number of PCA components (K) - use 15+ for random_iid
 
   # Measurement noise
   sigma_noise: 0.01                # Gaussian noise standard deviation
