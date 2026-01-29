@@ -91,8 +91,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--blur_mode",
         type=str,
-        choices=["motion", "defocus", "mixed", "random_iid"],
-        help="Type of spatially varying blur (random_iid = near-IID PSFs per pixel)",
+        choices=["motion", "defocus", "mixed", "random_iid", "correlated"],
+        help="Type of spatially varying blur (correlated = realistic optical aberrations)",
     )
     parser.add_argument(
         "--n_eigen_psfs",

@@ -31,6 +31,7 @@ physics:
   #   "defocus"    - Smoothly varying defocus (radius increases from center)
   #   "mixed"      - Alternating motion and defocus patterns
   #   "random_iid" - Near-IID random PSFs (drastically different between neighbors)
+  #   "correlated" - Spatially correlated asymmetric Gaussians (realistic aberrations)
   blur_mode: "motion"
 
   # Spatially varying blur parameters
@@ -51,6 +52,13 @@ physics:
   # Random IID blur specific parameters (near-pixel-level PSF variation)
   random_iid:
     grid_size: 64                  # Dense grid for IID-like variation (64x64)
+
+  # Correlated Gaussian blur parameters (realistic optical aberrations)
+  correlated:
+    sigma_scale: 0.2               # Scale factor for Gaussian widths (larger = wider PSFs)
+    mu_scale: 0.0                  # Scale factor for center offsets (0 = centered PSFs)
+    correlation_length: 7          # Spatial correlation length (larger = smoother variation)
+    grid_size: 8                   # Grid size (can match image size for smooth fields)
 
   # EigenPSF decomposition parameters
   n_eigen_psfs: 5                  # Number of PCA components (K) - use 15+ for random_iid

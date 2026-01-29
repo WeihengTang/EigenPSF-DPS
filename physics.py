@@ -24,7 +24,7 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
-from typing import Tuple, Optional, Literal
+from typing import Tuple, Optional, Literal, Dict, Any
 
 import torch
 import torch.nn as nn
@@ -88,11 +88,12 @@ class SVBlurSimulator:
 
     def simulate_sv_kernel_grid(
         self,
-        mode: Literal["motion", "defocus", "mixed", "random_iid"] = "motion",
+        mode: Literal["motion", "defocus", "mixed", "random_iid", "correlated"] = "motion",
         motion_length_range: Tuple[float, float] = (5.0, 25.0),
         motion_angle_variation: float = 180.0,
         defocus_radius_range: Tuple[float, float] = (2.0, 12.0),
         seed: Optional[int] = None,
+        correlated_config: Optional[Dict[str, Any]] = None,
     ) -> Tensor:
         """Generate a grid of spatially varying blur kernels.
 
@@ -102,10 +103,12 @@ class SVBlurSimulator:
                 - "defocus": Smoothly varying defocus blur (radius increases from center)
                 - "mixed": Alternating motion and defocus
                 - "random_iid": Near-IID random PSFs (drastically different between neighbors)
+                - "correlated": Spatially correlated asymmetric Gaussians (realistic aberrations)
             motion_length_range: (min, max) motion blur length in pixels
             motion_angle_variation: Angular variation in degrees
             defocus_radius_range: (min, max) defocus blur radius in pixels
             seed: Random seed for reproducibility
+            correlated_config: Config dict for correlated mode (sigma_scale, mu_scale, correlation_length)
 
         Returns:
             Tensor of shape (grid_size, grid_size, kernel_size, kernel_size)
@@ -113,6 +116,10 @@ class SVBlurSimulator:
         """
         if seed is not None:
             torch.manual_seed(seed)
+
+        # For correlated mode, use vectorized generation
+        if mode == "correlated":
+            return self._generate_correlated_gaussian_grid(correlated_config or {})
 
         kernels = torch.zeros(
             self.grid_size, self.grid_size, self.kernel_size, self.kernel_size,
@@ -368,6 +375,121 @@ class SVBlurSimulator:
         kernel = kernel / (kernel.sum() + 1e-8)
 
         return kernel
+
+    def _generate_correlated_field(
+        self,
+        shape: Tuple[int, int],
+        correlation_length: int = 7,
+    ) -> Tensor:
+        """Generate a spatially correlated random field.
+
+        Uses convolution with a box filter to create smooth spatial correlation.
+
+        Args:
+            shape: (H, W) shape of the field
+            correlation_length: Size of the smoothing kernel (larger = smoother)
+
+        Returns:
+            Correlated random field of shape (H, W)
+        """
+        noise = torch.randn(shape, device=self.device, dtype=self.dtype) * correlation_length
+        kernel = torch.ones(
+            (1, 1, correlation_length, correlation_length),
+            device=self.device,
+            dtype=self.dtype
+        ) / (correlation_length ** 2)
+
+        # Convolve noise with box filter to create correlation
+        noise_4d = noise.view(1, 1, shape[0], shape[1])
+        field = F.conv2d(noise_4d, kernel, padding=correlation_length // 2)
+
+        return field.view(shape[0], shape[1])
+
+    def _generate_correlated_gaussian_grid(
+        self,
+        config: Dict[str, Any],
+    ) -> Tensor:
+        """Generate a grid of spatially correlated asymmetric Gaussian PSFs.
+
+        This creates more realistic aberration patterns where PSF parameters
+        (scale, rotation, offset) vary smoothly but randomly across the image.
+
+        Args:
+            config: Configuration dict with keys:
+                - sigma_scale: Scale factor for Gaussian widths (default: 0.2)
+                - mu_scale: Scale factor for center offsets (default: 0.0)
+                - correlation_length: Spatial correlation length (default: 7)
+
+        Returns:
+            Tensor of shape (grid_size, grid_size, kernel_size, kernel_size)
+        """
+        N = self.grid_size
+        M = self.kernel_size
+
+        sigma_scale = config.get("sigma_scale", 0.2)
+        mu_scale = config.get("mu_scale", 0.0)
+        correlation_length = config.get("correlation_length", 7)
+
+        logger.info(f"Generating correlated Gaussian PSFs (sigma_scale={sigma_scale}, "
+                    f"mu_scale={mu_scale}, correlation_length={correlation_length})...")
+
+        # Create coordinate grid for PSF evaluation
+        t = torch.linspace(-3, 3, M, device=self.device, dtype=self.dtype)
+        grid_y, grid_x = torch.meshgrid(t, t, indexing='ij')
+        coords = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)  # (M*M, 2)
+
+        # Generate spatially correlated parameter fields
+        # Scale factors (width/height) - keep positive via exp()
+        sx = self._generate_correlated_field((N, N), correlation_length).exp() * sigma_scale
+        sy = self._generate_correlated_field((N, N), correlation_length).exp() * sigma_scale
+
+        # Rotation angle
+        theta = self._generate_correlated_field((N, N), correlation_length) * math.pi
+
+        # Center offsets
+        mux = self._generate_correlated_field((N, N), correlation_length) * mu_scale
+        muy = self._generate_correlated_field((N, N), correlation_length) * mu_scale
+
+        # Build rotation matrices: R @ S^2 @ R^T = Sigma (covariance)
+        cos_t = torch.cos(theta)
+        sin_t = torch.sin(theta)
+
+        # R: (N, N, 2, 2) rotation matrix
+        R = torch.stack([
+            torch.stack([cos_t, -sin_t], dim=-1),
+            torch.stack([sin_t, cos_t], dim=-1)
+        ], dim=-2)
+
+        # S: (N, N, 2, 2) scale matrix
+        S = torch.zeros((N, N, 2, 2), device=self.device, dtype=self.dtype)
+        S[..., 0, 0] = sx
+        S[..., 1, 1] = sy
+
+        # Covariance matrix: Sigma = R @ S^2 @ R^T
+        Sigma = R @ (S ** 2) @ R.transpose(-1, -2)
+
+        # Inverse covariance for Gaussian evaluation
+        inv_Sigma = torch.inverse(Sigma + 1e-6 * torch.eye(2, device=self.device, dtype=self.dtype))
+
+        # Mean offsets: (N, N, 1, 2)
+        mu = torch.stack([mux, muy], dim=-1).unsqueeze(-2)
+
+        # Coordinate differences: (1, 1, M*M, 2) - (N, N, 1, 2) = (N, N, M*M, 2)
+        diff = coords.view(1, 1, -1, 2) - mu
+
+        # Compute Mahalanobis distance: diff^T @ inv_Sigma @ diff
+        # Using einsum: (N, N, M*M, 2) @ (N, N, 2, 2) @ (N, N, M*M, 2) -> (N, N, M*M)
+        exponent = torch.einsum('bnmk,bnkq,bnmq->bnm', diff, inv_Sigma, diff)
+
+        # Compute Gaussians and reshape
+        gaussians = torch.exp(-0.5 * exponent).view(N, N, M, M)
+
+        # Normalize each PSF to sum to 1
+        gaussians = gaussians / (gaussians.sum(dim=(-2, -1), keepdim=True) + 1e-8)
+
+        logger.info("Correlated Gaussian PSF generation complete.")
+
+        return gaussians
 
     def interpolate_kernels_to_image(
         self,
@@ -706,12 +828,17 @@ def create_sv_blur_system(
     motion_cfg = config.get("motion", {})
     defocus_cfg = config.get("defocus", {})
     random_iid_cfg = config.get("random_iid", {})
+    correlated_cfg = config.get("correlated", {})
 
-    # For random_iid mode, use a much denser grid to get near-pixel variation
+    # Determine grid size based on mode
     if blur_mode == "random_iid":
         # Default to 64x64 grid for random_iid (can be overridden in config)
         grid_size = random_iid_cfg.get("grid_size", 64)
         logger.info(f"Using random_iid mode with dense {grid_size}x{grid_size} grid")
+    elif blur_mode == "correlated":
+        # Correlated mode uses image-resolution grid by default for smooth PSF fields
+        grid_size = correlated_cfg.get("grid_size", config.get("grid_size", 8))
+        logger.info(f"Using correlated mode with {grid_size}x{grid_size} grid")
     else:
         grid_size = config.get("grid_size", 8)
         logger.info(f"Using {blur_mode} mode with {grid_size}x{grid_size} grid")
@@ -739,6 +866,7 @@ def create_sv_blur_system(
             defocus_cfg.get("min_radius", 2),
             defocus_cfg.get("max_radius", 12),
         ),
+        correlated_config=correlated_cfg,
     )
 
     # Interpolate to full resolution for true operator
@@ -747,8 +875,13 @@ def create_sv_blur_system(
     logger.info(f"Interpolated kernel field shape: {kernel_field.shape}")
 
     # Compute EigenPSF decomposition
-    # For random_iid, recommend more components since the variation is higher
-    default_n_eigen = 15 if blur_mode == "random_iid" else 5
+    # For random_iid/correlated, recommend more components since the variation is higher
+    if blur_mode == "random_iid":
+        default_n_eigen = 15
+    elif blur_mode == "correlated":
+        default_n_eigen = 10
+    else:
+        default_n_eigen = 5
     n_eigen = config.get("n_eigen_psfs", default_n_eigen)
     logger.info(f"Step 3/4: Computing EigenPSF decomposition with {n_eigen} components...")
     decomposition = compute_eigen_decomposition(

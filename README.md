@@ -117,6 +117,9 @@ python main.py --blur_mode defocus
 # Use random IID blur (drastically varying PSFs between pixels)
 python main.py --blur_mode random_iid --n_eigen_psfs 15
 
+# Use correlated Gaussian blur (realistic optical aberrations)
+python main.py --blur_mode correlated --n_eigen_psfs 10
+
 # Adjust DPS step size (higher = stronger guidance)
 python main.py --step_size 1.0
 
@@ -169,13 +172,17 @@ model:
 
 # Physics / Blur simulation
 physics:
-  blur_mode: "motion"        # "motion", "defocus", "mixed", or "random_iid"
+  blur_mode: "motion"        # "motion", "defocus", "mixed", "random_iid", or "correlated"
   kernel_size: 21            # PSF kernel size
   grid_size: 8               # PSF sampling grid (8 for smooth, 64 for random_iid)
-  n_eigen_psfs: 5            # Number of PCA components (5 for smooth, 15+ for random_iid)
+  n_eigen_psfs: 5            # Number of PCA components (5 for smooth, 10+ for correlated/random_iid)
   sigma_noise: 0.01          # Measurement noise level
   random_iid:
     grid_size: 64            # Dense grid for near-pixel PSF variation
+  correlated:
+    sigma_scale: 0.2         # Gaussian width scale (larger = wider PSFs)
+    mu_scale: 0.0            # Center offset scale (0 = centered)
+    correlation_length: 7    # Spatial smoothness (larger = smoother)
 
 # DPS parameters
 dps:
@@ -197,7 +204,13 @@ output:
 | `motion` | Smoothly varying motion blur | Gradual (direction/length change slowly) | 5 |
 | `defocus` | Smoothly varying defocus | Gradual (radius increases from center) | 5 |
 | `mixed` | Alternating motion and defocus | Moderate | 5-10 |
+| `correlated` | Spatially correlated asymmetric Gaussians | Smooth random (realistic aberrations) | 10-15 |
 | `random_iid` | Near-IID random PSFs | Drastic (completely different neighbors) | 15-25 |
+
+The `correlated` mode generates realistic optical aberration patterns using spatially correlated random fields:
+- Asymmetric Gaussians with varying orientation, scale, and offset
+- PSF parameters vary smoothly across the image (controlled by `correlation_length`)
+- More realistic than deterministic modes, more tractable than `random_iid`
 
 The `random_iid` mode stress-tests the EigenPSF decomposition by generating independently sampled PSFs at each grid point:
 - Random motion blur (any angle, random length)
@@ -209,7 +222,7 @@ The `random_iid` mode stress-tests the EigenPSF decomposition by generating inde
 | Parameter | Description | Recommended Range |
 |-----------|-------------|-------------------|
 | `step_size` | DPS guidance strength | 0.1 - 2.0 |
-| `n_eigen_psfs` | Number of basis kernels | 5-15 (smooth), 15-25 (random_iid) |
+| `n_eigen_psfs` | Number of basis kernels | 5 (smooth), 10-15 (correlated), 15-25 (random_iid) |
 | `sigma_noise` | Noise standard deviation | 0.001 - 0.05 |
 | `num_inference_steps` | Diffusion sampling steps | 100 - 1000 |
 
