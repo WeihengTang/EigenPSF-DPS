@@ -180,7 +180,7 @@ physics:
   random_iid:
     grid_size: 64            # Dense grid for near-pixel PSF variation
   correlated:
-    sigma_scale: 0.2         # Gaussian width scale (larger = wider PSFs)
+    sigma_scale: 1.0         # Gaussian width scale (larger = wider PSFs)
     mu_scale: 0.0            # Center offset scale (0 = centered)
     correlation_length: 7    # Spatial smoothness (larger = smoother)
 

@@ -55,7 +55,7 @@ physics:
 
   # Correlated Gaussian blur parameters (realistic optical aberrations)
   correlated:
-    sigma_scale: 0.2               # Scale factor for Gaussian widths (larger = wider PSFs)
+    sigma_scale: 1.0               # Scale factor for Gaussian widths (larger = wider PSFs)
     mu_scale: 0.0                  # Scale factor for center offsets (0 = centered PSFs)
     correlation_length: 7          # Spatial correlation length (larger = smoother variation)
     grid_size: 8                   # Grid size (can match image size for smooth fields)

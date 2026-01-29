@@ -416,7 +416,7 @@ class SVBlurSimulator:
 
         Args:
             config: Configuration dict with keys:
-                - sigma_scale: Scale factor for Gaussian widths (default: 0.2)
+                - sigma_scale: Scale factor for Gaussian widths (default: 1.0)
                 - mu_scale: Scale factor for center offsets (default: 0.0)
                 - correlation_length: Spatial correlation length (default: 7)
 
@@ -426,7 +426,7 @@ class SVBlurSimulator:
         N = self.grid_size
         M = self.kernel_size
 
-        sigma_scale = config.get("sigma_scale", 0.2)
+        sigma_scale = config.get("sigma_scale", 1.0)
         mu_scale = config.get("mu_scale", 0.0)
         correlation_length = config.get("correlation_length", 7)
 
