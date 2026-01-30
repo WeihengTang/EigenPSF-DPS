@@ -88,7 +88,7 @@ class SVBlurSimulator:
 
     def simulate_sv_kernel_grid(
         self,
-        mode: Literal["motion", "defocus", "mixed", "random_iid", "correlated"] = "motion",
+        mode: Literal["motion", "defocus", "mixed", "random_iid", "gaussian_iid", "correlated"] = "motion",
         motion_length_range: Tuple[float, float] = (5.0, 25.0),
         motion_angle_variation: float = 180.0,
         defocus_radius_range: Tuple[float, float] = (2.0, 12.0),
@@ -103,6 +103,7 @@ class SVBlurSimulator:
                 - "defocus": Smoothly varying defocus blur (radius increases from center)
                 - "mixed": Alternating motion and defocus
                 - "random_iid": Near-IID random PSFs (drastically different between neighbors)
+                - "gaussian_iid": IID asymmetric Gaussian PSFs (random orientation/scale per grid point)
                 - "correlated": Spatially correlated asymmetric Gaussians (realistic aberrations)
             motion_length_range: (min, max) motion blur length in pixels
             motion_angle_variation: Angular variation in degrees
@@ -157,6 +158,8 @@ class SVBlurSimulator:
                         motion_length_range,
                         defocus_radius_range
                     )
+                elif mode == "gaussian_iid":
+                    kernel = self._random_gaussian_kernel()
                 else:  # mixed
                     if (i + j) % 2 == 0:
                         kernel = self._create_motion_kernel(
@@ -830,11 +833,16 @@ def create_sv_blur_system(
     random_iid_cfg = config.get("random_iid", {})
     correlated_cfg = config.get("correlated", {})
 
+    gaussian_iid_cfg = config.get("gaussian_iid", {})
+
     # Determine grid size based on mode
     if blur_mode == "random_iid":
         # Default to 64x64 grid for random_iid (can be overridden in config)
         grid_size = random_iid_cfg.get("grid_size", 64)
         logger.info(f"Using random_iid mode with dense {grid_size}x{grid_size} grid")
+    elif blur_mode == "gaussian_iid":
+        grid_size = gaussian_iid_cfg.get("grid_size", 64)
+        logger.info(f"Using gaussian_iid mode with dense {grid_size}x{grid_size} grid")
     elif blur_mode == "correlated":
         # Correlated mode uses image-resolution grid by default for smooth PSF fields
         grid_size = correlated_cfg.get("grid_size", config.get("grid_size", 8))
@@ -876,7 +884,7 @@ def create_sv_blur_system(
 
     # Compute EigenPSF decomposition
     # For random_iid/correlated, recommend more components since the variation is higher
-    if blur_mode == "random_iid":
+    if blur_mode in ("random_iid", "gaussian_iid"):
         default_n_eigen = 15
     elif blur_mode == "correlated":
         default_n_eigen = 10

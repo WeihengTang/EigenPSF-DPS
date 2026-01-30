@@ -205,7 +205,8 @@ output:
 | `defocus` | Smoothly varying defocus | Gradual (radius increases from center) | 5 |
 | `mixed` | Alternating motion and defocus | Moderate | 5-10 |
 | `correlated` | Spatially correlated asymmetric Gaussians | Smooth random (realistic aberrations) | 10-15 |
-| `random_iid` | Near-IID random PSFs | Drastic (completely different neighbors) | 15-25 |
+| `gaussian_iid` | IID asymmetric Gaussian PSFs only | Drastic (random orientation/scale per pixel) | 15-25 |
+| `random_iid` | Near-IID random PSFs (mixed types) | Drastic (completely different neighbors) | 15-25 |
 
 The `correlated` mode generates realistic optical aberration patterns using spatially correlated random fields:
 - Asymmetric Gaussians with varying orientation, scale, and offset
