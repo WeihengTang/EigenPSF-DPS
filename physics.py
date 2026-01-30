@@ -655,11 +655,51 @@ class SVBlurOperator(nn.Module):
         self.padding = self.kernel_size // 2
         self.padding_mode = padding_mode
 
+        # Precompute A(1) for normalization: the EigenPSF approximation doesn't
+        # guarantee that the reconstructed kernels sum to 1 at every pixel.
+        # Dividing by A(1) corrects this spatially varying gain error.
+        self._precompute_normalization()
+
+    def _precompute_normalization(self) -> None:
+        """Compute A(1) — the operator applied to a constant image of ones.
+
+        This normalization map corrects the spatially varying gain introduced
+        by the truncated PCA approximation.
+        """
+        H, W = self.coefficient_maps.shape[1], self.coefficient_maps.shape[2]
+
+        # Build A(1) using a single-channel ones image
+        ones = torch.ones(1, 1, H, W, device=self.coefficient_maps.device,
+                          dtype=self.coefficient_maps.dtype)
+
+        norm_map = torch.zeros_like(ones)
+
+        for k in range(self.n_components):
+            kernel_k = self.basis_kernels[k:k+1]
+            coeff_k = self.coefficient_maps[k:k+1].unsqueeze(0)  # (1, 1, H, W)
+
+            weighted = coeff_k * ones
+            if self.padding > 0:
+                weighted = F.pad(weighted, [self.padding] * 4, mode=self.padding_mode)
+
+            kernel_expanded = kernel_k.expand(1, 1, -1, -1)
+            conv_result = F.conv2d(weighted, kernel_expanded, padding=0, groups=1)
+            norm_map = norm_map + conv_result
+
+        # Clamp to avoid division by zero
+        norm_map = norm_map.clamp(min=1e-6)
+
+        # Store as (1, 1, H, W) buffer — broadcasts across batch and channels
+        self.register_buffer("norm_map", norm_map)
+        logger.debug(f"Normalization map: min={norm_map.min():.4f}, max={norm_map.max():.4f}, "
+                     f"mean={norm_map.mean():.4f}")
+
     def forward(self, x: Tensor) -> Tensor:
         """Apply spatially varying blur to input image (scattering formulation).
 
-        Scattering: each input pixel's contribution is first weighted by the
-        local coefficient, then scattered/convolved with the basis kernel.
+        Computes A(x) / A(1) where A(x) = Σ_k (C_k ⊙ x) * B_k.
+        Dividing by A(1) corrects the spatially varying gain from the
+        truncated EigenPSF approximation.
 
         Args:
             x: Input tensor of shape (B, C, H, W)
@@ -702,15 +742,18 @@ class SVBlurOperator(nn.Module):
 
             output = output + conv_result
 
+        # Normalize by A(1) to correct spatially varying gain
+        output = output / self.norm_map
+
         return output
 
     def adjoint(self, y: Tensor) -> Tensor:
-        """Apply adjoint (transpose) of the blur operator.
+        """Apply adjoint (transpose) of the normalized blur operator.
 
-        The adjoint of the SV blur is needed for some optimization algorithms.
-        For scattering formulation A(x) = Σ_k (C_k ⊙ x) * B_k,
-        the adjoint is gathering: A^T(y) = Σ_k C_k ⊙ (y * B_k^T)
-        where B_k^T is the flipped kernel.
+        For the normalized operator Ã(x) = A(x) / A(1), the adjoint is:
+            Ã^T(y) = A^T(y / A(1))
+        where A^T is the adjoint of the unnormalized operator (gathering formulation):
+            A^T(y) = Σ_k C_k ⊙ (y * B_k^T)
 
         Args:
             y: Input tensor of shape (B, C, H, W)
@@ -719,6 +762,9 @@ class SVBlurOperator(nn.Module):
             Result of adjoint operation, shape (B, C, H, W)
         """
         B, C, H, W = y.shape
+
+        # Pre-divide by normalization map (adjoint of division)
+        y = y / self.norm_map
 
         # Apply reflection padding to input
         if self.padding > 0:
